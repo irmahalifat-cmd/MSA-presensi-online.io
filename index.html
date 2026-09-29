@@ -606,16 +606,42 @@ const ICON = {
 const API_URL = 'https://script.google.com/macros/s/AKfycbxA9V-lDhZfrwHsE_-Kf1U6akhbk6adqOFHk7lEjxghc6vlkiFDjdh3UkPLpFnIEabSRA/exec'
 const API_KEY = 'SMA04T'; // samakan dengan API_PASSWORD di Code.gs
 
+// [SESI TOKEN] Token dari checkPin (per peran) disimpan di memori saja dan
+// disertakan pada setiap aksi tulis — Code.gs Patch 16 menolak aksi tulis tanpa token.
+const sessionTokens = { admin:null, petugas:null };
+const ADMIN_ONLY_ACTIONS = ['addStudent','addStudentsBulk','deleteStudent','updatePhoto'];
+const LOG_ACTIONS = ['addLog','updateLog'];
+function tokenForAction(action){
+  if(ADMIN_ONLY_ACTIONS.includes(action)) return sessionTokens.admin;
+  if(LOG_ACTIONS.includes(action)) return sessionTokens.petugas || sessionTokens.admin;
+  return undefined;
+}
+// Sesi habis/tidak valid: hapus token, kunci kembali panel, dan arahkan ke layar PIN.
+function handleSessionExpired(){
+  sessionTokens.admin = null; sessionTokens.petugas = null;
+  const wasUnlocked = state.adminUnlocked || state.petugasUnlocked;
+  state.adminUnlocked = false; state.petugasUnlocked = false;
+  if(!wasUnlocked) return; // sudah ditangani oleh panggilan sebelumnya
+  try{ stopCamera(); redrawCamButton(); }catch(e){}
+  if(state.screen === 'admin') state.screen = 'adminLogin';
+  else if(state.screen === 'petugasMode' || state.screen === 'petugasScan') state.screen = 'petugasLogin';
+  render();
+  showToast('Sesi berakhir. Masukkan PIN lagi untuk melanjutkan.', 'warn');
+}
+
 async function callApi(payload){
   if(!API_URL){ throw new Error('SERVER_BELUM_DIKONFIGURASI'); }
+  const token = tokenForAction(payload.action);
   const res = await fetch(API_URL, {
     method:'POST',
     headers:{ 'Content-Type':'text/plain;charset=utf-8' }, // hindari CORS preflight Apps Script
-    body: JSON.stringify({ ...payload, key: API_KEY })
+    body: JSON.stringify({ ...payload, key: API_KEY, ...(token ? { token } : {}) })
   });
   const json = await res.json();
   if(!json.ok){
+    if(json.sessionExpired){ handleSessionExpired(); }
     const err = new Error(json.error || 'Permintaan ditolak server.');
+    if(json.sessionExpired){ err.sessionExpired = true; }
     // Tandai error ini sebagai penolakan DUPLIKAT (bukan sekadar gagal jaringan)
     // supaya pemanggil (tickScan/confirmManualAttendance) bisa menampilkan
     // notifikasi yang tepat — bukan menganggapnya berhasil secara diam-diam.
@@ -911,6 +937,7 @@ async function saveLogEntry(log){
       await callApi({ action:'addLog', log });
       return { ok:true };
     }catch(e){
+      if(e.sessionExpired){ return { ok:false, sessionExpired:true }; } // JANGAN simpan lokal diam-diam
       if(e.duplicate){
         return { ok:false, duplicate:true, existing:e.existing };
       }
@@ -942,8 +969,9 @@ async function updateLogEntry(log){
   if(API_URL){
     try{
       await callApi({ action:'updateLog', log });
-      return;
+      return true;
     }catch(e){
+      if(e.sessionExpired){ return false; }
       // lanjut ke penyimpanan lokal di bawah supaya perubahan tidak hilang
     }
   }
@@ -2005,6 +2033,7 @@ async function submitPin(){
   try{
     const res = await callApi({ action:'checkPin', role, pin:val });
     if(res.valid){
+      if(res.token){ sessionTokens[role] = res.token; }
       if(role === 'admin'){ state.adminUnlocked = true; state.screen = 'admin'; }
       else{ state.petugasUnlocked = true; state.screen = 'petugasMode'; }
       state.pinLoading = false;
@@ -2012,7 +2041,9 @@ async function submitPin(){
     }else{
       state.pinLoading = false;
       render();
-      document.getElementById('pinErr').textContent = 'PIN salah, silakan coba lagi.';
+      document.getElementById('pinErr').textContent = res.locked
+        ? ('Terlalu banyak PIN salah. Dikunci sementara, coba lagi dalam ' + Math.max(1, Math.ceil((res.retryAfterSeconds || 900) / 60)) + ' menit.')
+        : 'PIN salah, silakan coba lagi.';
     }
   }catch(err){
     state.pinLoading = false;
@@ -2762,6 +2793,10 @@ async function confirmManualAttendance(type){
   // siswa yang sama pada hari yang sama.
   const result = await saveLogEntry(log);
   const label = type==='masuk' ? 'MASUK' : 'PULANG';
+  if(result.sessionExpired){
+    if(btn){ btn.disabled = false; btn.textContent = btn.dataset.origText || btn.textContent; }
+    return;
+  }
 
   if(result.duplicate){
     if(result.existing && !state.logs.some(l=>l.id===result.existing.id)){
@@ -2822,12 +2857,14 @@ async function confirmTidakHadir(){
 
   if(existing){
     existing.ket = ket; existing.note = note;
-    await updateLogEntry(existing);
+    const updOk = await updateLogEntry(existing);
+    if(updOk === false){ if(btn){ btn.disabled = false; btn.textContent = btn.dataset.origText || btn.textContent; } return; }
     playScanBeep();
     state.lastResult = { student:s, ket, sendWa, type:'tidakHadir', updated:true };
   }else{
     const log = { id:uid(), studentId:s.id, type:'tidakHadir', ket, note, timestamp:Date.now() };
     const result = await saveLogEntry(log);
+    if(result.sessionExpired){ if(btn){ btn.disabled = false; btn.textContent = btn.dataset.origText || btn.textContent; } return; }
     if(result.duplicate){
       if(result.existing && !state.logs.some(l=>l.id===result.existing.id)){
         state.logs.push(result.existing);
@@ -3394,6 +3431,7 @@ async function tickScan(video){
         let result;
         try{ result = await saveLogEntry(log); }
         catch(saveErr){ delete state.scanCooldowns[scannedCode]; playRejectBeep(); showToast('Gagal menyimpan pemindaian — pindai ulang kartunya.', 'err'); return; }
+        if(result.sessionExpired){ delete state.scanCooldowns[scannedCode]; return; } // sesi habis — tidak ada yang tercatat
         const label = state.petugasMode==='masuk' ? 'MASUK' : 'PULANG';
         if(result.duplicate){
           // Sudah tercatat lebih dulu di PERANGKAT LAIN — selaraskan cache
