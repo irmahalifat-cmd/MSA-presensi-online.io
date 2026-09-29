@@ -1022,7 +1022,7 @@ function topbar(){
   return `
   <div class="topbar">
     <div class="brand">
-      <div class="brand-mark"><img src="${LOGO_DATA_URI}" alt="Logo Modernisasi Sistem Administrasi"></div>
+      <div class="brand-mark"><img src="${LOGO_DATA_URI}" alt="Logo Tut Wuri Handayani"></div>
       <div class="brand-text">
         <div class="name">CATATAN PRESENSI SISWA SISWI</div>
         <div class="sub">Modernisasi Sistem Administrasi</div>
@@ -1329,7 +1329,7 @@ function qrModal(student){
     <div class="qr-modal">
       <div class="id-card">
         <div class="id-head">
-          <img src="${LOGO_DATA_URI}" alt="Logo Modernisasi Sistem Administrasi">
+          <img src="${LOGO_DATA_URI}" alt="Logo Tut Wuri Handayani">
           <div class="school">STUDENT ATTENDANCE CARD</div>
         </div>
         <div class="id-body">
@@ -3012,7 +3012,7 @@ function scheduleNextScan(video){
     scanRAF = requestAnimationFrame(()=>tickScan(video));
   }
 }
-const MAX_SCAN_DIM = 720; // diperkecil dari 900 — jsQR memproses lebih cepat pada gambar lebih kecil, menambah jumlah percobaan pembacaan per detik
+let MAX_SCAN_DIM = 720; // diperkecil dari 900 — jsQR memproses lebih cepat pada gambar lebih kecil, menambah jumlah percobaan pembacaan per detik
 
 // [PENGUATAN PEMINDAIAN] BarcodeDetector — decoder QR NATIVE bawaan OS/
 // browser (dipercepat perangkat keras), TERUTAMA tersedia di Android/
@@ -3038,6 +3038,16 @@ let nativeBarcodeDetector = null;
   }
 })();
 
+// [PERKUATAN PEMINDAIAN] Resolusi decode jsQR menyesuaikan kecepatan perangkat:
+// HP lambat otomatis memakai gambar lebih kecil (lebih banyak percobaan/detik),
+// HP cepat memakai gambar lebih besar (lebih mampu membaca QR kecil/jauh).
+let jsqrEma = 0, jsqrN = 0;
+function adaptScanDim(ms){
+  jsqrEma = jsqrEma ? jsqrEma*0.8 + ms*0.2 : ms;
+  if(++jsqrN % 8) return;
+  if(jsqrEma > 55) MAX_SCAN_DIM = Math.max(400, Math.round(MAX_SCAN_DIM*0.9));
+  else if(jsqrEma < 22) MAX_SCAN_DIM = Math.min(800, Math.round(MAX_SCAN_DIM*1.06));
+}
 const SCAN_COOLDOWN_MS = 2500; // jeda singkat anti-dobel (kode tak dikenali / sudah tercatat menurut cache lokal)
 const SAME_CODE_SUCCESS_COOLDOWN_MS = 60 * 1000; // 60 detik — jeda panjang untuk kode QR yang SAMA setelah berhasil tercatat (Masuk maupun Pulang)
 // Rangkaian constraint kamera dari yang paling spesifik ke yang paling longgar.
@@ -3243,6 +3253,59 @@ document.addEventListener('visibilitychange', () => {
     redrawCamButton();
   }
 });
+// [PERKUATAN PEMINDAIAN] Konfirmasi server dijalankan TERPISAH dari loop kamera.
+// Sebelumnya kamera berhenti memindai selama menunggu balasan server (bisa 1-3 detik
+// di Apps Script), sehingga siswa berikutnya harus menunggu. Sekarang kamera langsung
+// lanjut memindai; kode yang sedang diproses sudah dikunci (cooldown) sebelum request
+// dikirim, jadi tidak mungkin terkirim dua kali.
+async function processScanResult(found, scannedCode, now, mode){
+  try{
+          const log = { id:uid(), studentId:found.id, type:mode, ket:'', note:'', timestamp:now };
+        const result = await saveLogEntry(log);
+        const label = mode==='masuk' ? 'MASUK' : 'PULANG';
+        if(result.duplicate){
+          // Sudah tercatat lebih dulu di PERANGKAT LAIN — selaraskan cache
+          // lokal dengan data sebenarnya dari server supaya pemindaian
+          // berikutnya di HP ini langsung tahu tanpa perlu ke jaringan lagi.
+          if(result.existing && !state.logs.some(l=>l.id===result.existing.id)){
+            state.logs.push(result.existing);
+          }
+          state.scanCooldowns[scannedCode] = now + SAME_CODE_SUCCESS_COOLDOWN_MS;
+          playRejectBeep();
+          const waktu = result.existing ? ` pukul ${timeOnly(result.existing.timestamp)}` : '';
+          showToast(`Pemindaian ditolak — ${found.name} sudah tercatat ${label} hari ini${waktu} (di perangkat lain).`, 'warn');
+          return;
+        }
+        // Siswa ini SUDAH tercatat "Tidak Hadir" (Sakit/Ijin/Emergency/Lainnya
+        // — termasuk keterangan tulisan bebas) hari ini — TIDAK BOLEH lagi
+        // tercatat Masuk/Pulang lewat pemindaian QR di hari yang sama.
+        // Ditolak oleh server (lihat addLog_ di Code.gs), berlaku LINTAS
+        // PERANGKAT. Dikunci jeda panjang juga supaya kamera tidak
+        // terus-menerus memeriksa ulang kode QR yang sama.
+        if(result.blockedByTidakHadir){
+          state.scanCooldowns[scannedCode] = now + SAME_CODE_SUCCESS_COOLDOWN_MS;
+          playRejectBeep();
+          const ketTerdaftar = (result.existing && result.existing.ket) ? result.existing.ket : 'Tidak Hadir';
+          showToast(`Pemindaian ditolak — ${found.name} sudah tercatat TIDAK HADIR (${ketTerdaftar}) hari ini, sehingga tidak bisa dicatat ${label}.`, 'warn');
+          return;
+        }
+        // BERHASIL — kunci kode QR ini selama 60 detik ke depan; selama itu
+        // kamera tidak akan merespons kode yang sama sama sekali, tapi tetap
+        // bebas memindai kode/siswa LAIN seperti biasa.
+        state.scanCooldowns[scannedCode] = now + SAME_CODE_SUCCESS_COOLDOWN_MS;
+        playScanBeep();
+        state.logs.push(log);
+        state.lastResult = { student:found, ket:'', sendWa:state.sendWaNotif, type:mode };
+        const offlineNote = result.offline ? ' (belum tersinkron ke server — periksa koneksi)' : '';
+        showToast(`Tercatat — ${found.name} ${label} pukul ${timeOnly(now)}${offlineNote}`, result.offline ? 'warn' : 'ok');
+        refreshSidePanel();
+  }catch(e){
+    // gagal tak terduga — buka kunci supaya kartu bisa dipindai ulang
+    delete state.scanCooldowns[scannedCode];
+    showToast('Terjadi kesalahan saat memproses pemindaian. Silakan pindai ulang.', 'err');
+  }
+}
+
 async function tickScan(video){
   if(!state.cameraActive) return;
   try{
@@ -3292,7 +3355,9 @@ async function tickScan(video){
         scanCanvas.width = sw; scanCanvas.height = sh;
         scanCtx.drawImage(video, 0, 0, sw, sh);
         const img = scanCtx.getImageData(0, 0, sw, sh);
+        const t0 = performance.now();
         code = jsQR(img.data, img.width, img.height, JSQR_OPTS);
+        adaptScanDim(performance.now()-t0);
       }
       // LAPISAN KEDUA — khusus kode QR yang kecil/berjarak agak jauh: kalau
       // pemindaian utama di atas tidak menemukan apa pun, coba pindai ULANG
@@ -3376,47 +3441,11 @@ async function tickScan(video){
         // sebelum benar-benar dianggap berhasil. Inilah yang mencegah dua
         // perangkat berbeda sama-sama berhasil memindai siswa yang sama pada
         // hari yang sama: server yang jadi wasit tunggal, bukan HP masing-masing.
-        const log = { id:uid(), studentId:found.id, type:state.petugasMode, ket:'', note:'', timestamp:now };
-        const result = await saveLogEntry(log);
-        const label = state.petugasMode==='masuk' ? 'MASUK' : 'PULANG';
-        if(result.duplicate){
-          // Sudah tercatat lebih dulu di PERANGKAT LAIN — selaraskan cache
-          // lokal dengan data sebenarnya dari server supaya pemindaian
-          // berikutnya di HP ini langsung tahu tanpa perlu ke jaringan lagi.
-          if(result.existing && !state.logs.some(l=>l.id===result.existing.id)){
-            state.logs.push(result.existing);
-          }
-          state.scanCooldowns[scannedCode] = now + SAME_CODE_SUCCESS_COOLDOWN_MS;
-          playRejectBeep();
-          const waktu = result.existing ? ` pukul ${timeOnly(result.existing.timestamp)}` : '';
-          showToast(`Pemindaian ditolak — ${found.name} sudah tercatat ${label} hari ini${waktu} (di perangkat lain).`, 'warn');
-          scheduleNextScan(video);
-          return;
-        }
-        // Siswa ini SUDAH tercatat "Tidak Hadir" (Sakit/Ijin/Emergency/Lainnya
-        // — termasuk keterangan tulisan bebas) hari ini — TIDAK BOLEH lagi
-        // tercatat Masuk/Pulang lewat pemindaian QR di hari yang sama.
-        // Ditolak oleh server (lihat addLog_ di Code.gs), berlaku LINTAS
-        // PERANGKAT. Dikunci jeda panjang juga supaya kamera tidak
-        // terus-menerus memeriksa ulang kode QR yang sama.
-        if(result.blockedByTidakHadir){
-          state.scanCooldowns[scannedCode] = now + SAME_CODE_SUCCESS_COOLDOWN_MS;
-          playRejectBeep();
-          const ketTerdaftar = (result.existing && result.existing.ket) ? result.existing.ket : 'Tidak Hadir';
-          showToast(`Pemindaian ditolak — ${found.name} sudah tercatat TIDAK HADIR (${ketTerdaftar}) hari ini, sehingga tidak bisa dicatat ${label}.`, 'warn');
-          scheduleNextScan(video);
-          return;
-        }
-        // BERHASIL — kunci kode QR ini selama 60 detik ke depan; selama itu
-        // kamera tidak akan merespons kode yang sama sama sekali, tapi tetap
-        // bebas memindai kode/siswa LAIN seperti biasa.
+        // Kunci kode ini LEBIH DULU (sebelum menunggu server) lalu proses di latar belakang,
+        // sehingga kamera tetap bisa langsung memindai kartu berikutnya.
         state.scanCooldowns[scannedCode] = now + SAME_CODE_SUCCESS_COOLDOWN_MS;
-        playScanBeep();
-        state.logs.push(log);
-        state.lastResult = { student:found, ket:'', sendWa:state.sendWaNotif, type:state.petugasMode };
-        const offlineNote = result.offline ? ' (belum tersinkron ke server — periksa koneksi)' : '';
-        showToast(`Tercatat — ${found.name} ${label} pukul ${timeOnly(now)}${offlineNote}`, result.offline ? 'warn' : 'ok');
-        refreshSidePanel();
+        try{ if(navigator.vibrate) navigator.vibrate(35); }catch(e){} // umpan balik instan: kode terbaca
+        processScanResult(found, scannedCode, now, state.petugasMode);
         scheduleNextScan(video);
         return;
       }
