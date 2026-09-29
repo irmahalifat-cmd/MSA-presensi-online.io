@@ -606,42 +606,16 @@ const ICON = {
 const API_URL = 'https://script.google.com/macros/s/AKfycbyeOwnyamM5KXR5m0oU5vzl-REglRS7db0wNOdF9KlM4gYQQj1HQd_qvzQwfR2OYhk1qQ/exec'
 const API_KEY = 'SMA04T'; // samakan dengan API_PASSWORD di Code.gs
 
-// [SESI TOKEN] Token dari checkPin (per peran) disimpan di memori saja dan
-// disertakan pada setiap aksi tulis — Code.gs Patch 16 menolak aksi tulis tanpa token.
-const sessionTokens = { admin:null, petugas:null };
-const ADMIN_ONLY_ACTIONS = ['addStudent','addStudentsBulk','deleteStudent','updatePhoto'];
-const LOG_ACTIONS = ['addLog','updateLog'];
-function tokenForAction(action){
-  if(ADMIN_ONLY_ACTIONS.includes(action)) return sessionTokens.admin;
-  if(LOG_ACTIONS.includes(action)) return sessionTokens.petugas || sessionTokens.admin;
-  return undefined;
-}
-// Sesi habis/tidak valid: hapus token, kunci kembali panel, dan arahkan ke layar PIN.
-function handleSessionExpired(){
-  sessionTokens.admin = null; sessionTokens.petugas = null;
-  const wasUnlocked = state.adminUnlocked || state.petugasUnlocked;
-  state.adminUnlocked = false; state.petugasUnlocked = false;
-  if(!wasUnlocked) return; // sudah ditangani oleh panggilan sebelumnya
-  try{ stopCamera(); redrawCamButton(); }catch(e){}
-  if(state.screen === 'admin') state.screen = 'adminLogin';
-  else if(state.screen === 'petugasMode' || state.screen === 'petugasScan') state.screen = 'petugasLogin';
-  render();
-  showToast('Sesi berakhir. Masukkan PIN lagi untuk melanjutkan.', 'warn');
-}
-
 async function callApi(payload){
   if(!API_URL){ throw new Error('SERVER_BELUM_DIKONFIGURASI'); }
-  const token = tokenForAction(payload.action);
   const res = await fetch(API_URL, {
     method:'POST',
     headers:{ 'Content-Type':'text/plain;charset=utf-8' }, // hindari CORS preflight Apps Script
-    body: JSON.stringify({ ...payload, key: API_KEY, ...(token ? { token } : {}) })
+    body: JSON.stringify({ ...payload, key: API_KEY })
   });
   const json = await res.json();
   if(!json.ok){
-    if(json.sessionExpired){ handleSessionExpired(); }
     const err = new Error(json.error || 'Permintaan ditolak server.');
-    if(json.sessionExpired){ err.sessionExpired = true; }
     // Tandai error ini sebagai penolakan DUPLIKAT (bukan sekadar gagal jaringan)
     // supaya pemanggil (tickScan/confirmManualAttendance) bisa menampilkan
     // notifikasi yang tepat — bukan menganggapnya berhasil secara diam-diam.
@@ -937,7 +911,6 @@ async function saveLogEntry(log){
       await callApi({ action:'addLog', log });
       return { ok:true };
     }catch(e){
-      if(e.sessionExpired){ return { ok:false, sessionExpired:true }; } // JANGAN simpan lokal diam-diam
       if(e.duplicate){
         return { ok:false, duplicate:true, existing:e.existing };
       }
@@ -969,9 +942,8 @@ async function updateLogEntry(log){
   if(API_URL){
     try{
       await callApi({ action:'updateLog', log });
-      return true;
+      return;
     }catch(e){
-      if(e.sessionExpired){ return false; }
       // lanjut ke penyimpanan lokal di bawah supaya perubahan tidak hilang
     }
   }
@@ -2033,7 +2005,6 @@ async function submitPin(){
   try{
     const res = await callApi({ action:'checkPin', role, pin:val });
     if(res.valid){
-      if(res.token){ sessionTokens[role] = res.token; }
       if(role === 'admin'){ state.adminUnlocked = true; state.screen = 'admin'; }
       else{ state.petugasUnlocked = true; state.screen = 'petugasMode'; }
       state.pinLoading = false;
@@ -2041,9 +2012,7 @@ async function submitPin(){
     }else{
       state.pinLoading = false;
       render();
-      document.getElementById('pinErr').textContent = res.locked
-        ? ('Terlalu banyak PIN salah. Dikunci sementara, coba lagi dalam ' + Math.max(1, Math.ceil((res.retryAfterSeconds || 900) / 60)) + ' menit.')
-        : 'PIN salah, silakan coba lagi.';
+      document.getElementById('pinErr').textContent = 'PIN salah, silakan coba lagi.';
     }
   }catch(err){
     state.pinLoading = false;
@@ -2793,10 +2762,6 @@ async function confirmManualAttendance(type){
   // siswa yang sama pada hari yang sama.
   const result = await saveLogEntry(log);
   const label = type==='masuk' ? 'MASUK' : 'PULANG';
-  if(result.sessionExpired){
-    if(btn){ btn.disabled = false; btn.textContent = btn.dataset.origText || btn.textContent; }
-    return;
-  }
 
   if(result.duplicate){
     if(result.existing && !state.logs.some(l=>l.id===result.existing.id)){
@@ -2857,14 +2822,12 @@ async function confirmTidakHadir(){
 
   if(existing){
     existing.ket = ket; existing.note = note;
-    const updOk = await updateLogEntry(existing);
-    if(updOk === false){ if(btn){ btn.disabled = false; btn.textContent = btn.dataset.origText || btn.textContent; } return; }
+    await updateLogEntry(existing);
     playScanBeep();
     state.lastResult = { student:s, ket, sendWa, type:'tidakHadir', updated:true };
   }else{
     const log = { id:uid(), studentId:s.id, type:'tidakHadir', ket, note, timestamp:Date.now() };
     const result = await saveLogEntry(log);
-    if(result.sessionExpired){ if(btn){ btn.disabled = false; btn.textContent = btn.dataset.origText || btn.textContent; } return; }
     if(result.duplicate){
       if(result.existing && !state.logs.some(l=>l.id===result.existing.id)){
         state.logs.push(result.existing);
@@ -3175,7 +3138,6 @@ async function toggleCamera(){
 
     const stream = await getCameraStream();
     state.cameraStream = stream; state.cameraActive = true;
-    stream.getVideoTracks().forEach(t=>{ t.onended = ()=>{ if(state.cameraStream===stream){ stopCamera(); redrawCamButton(); showToast('Kamera terputus. Tekan "Aktifkan Kamera" untuk memulai lagi.', 'warn'); } }; });
 
     const video = document.getElementById('camVideo');
     // Set atribut secara eksplisit lewat JS juga (bukan hanya lewat HTML) karena
@@ -3281,22 +3243,8 @@ document.addEventListener('visibilitychange', () => {
     redrawCamButton();
   }
 });
-let scanInvertCounter = 0;
-// Bila beberapa QR terlihat sekaligus, pilih yang TIDAK sedang dalam masa jeda.
-function pickBarcode(list){
-  if(!list || !list.length) return null;
-  const now = Date.now(); let fallback = null;
-  for(const b of list){
-    const v = b && b.rawValue && b.rawValue.trim(); if(!v) continue;
-    const until = state.scanCooldowns[v];
-    if(!until || now >= until) return { data:b.rawValue };
-    if(!fallback) fallback = { data:b.rawValue };
-  }
-  return fallback;
-}
 async function tickScan(video){
   if(!state.cameraActive) return;
-  let resumed = false; const resume = () => { if(!resumed){ resumed = true; scheduleNextScan(video); } }; // menjadwalkan frame berikutnya SEKALI saja
   try{
     if(video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth > 0){
       const vw = video.videoWidth, vh = video.videoHeight;
@@ -3316,7 +3264,9 @@ async function tickScan(video){
       if(nativeBarcodeDetector){
         try{
           const barcodes = await nativeBarcodeDetector.detect(video);
-          code = pickBarcode(barcodes);
+          if(barcodes && barcodes.length && barcodes[0].rawValue){
+            code = { data: barcodes[0].rawValue };
+          }
         }catch(e){
           // Native detector betul-betul bermasalah — matikan untuk SISA sesi
           // pemindaian ini (bukan hanya frame ini), lalu langsung lanjut ke
@@ -3368,7 +3318,9 @@ async function tickScan(video){
           if(nativeBarcodeDetector){
             try{
               const barcodes = await nativeBarcodeDetector.detect(scanCanvasFull);
-              code = pickBarcode(barcodes);
+              if(barcodes && barcodes.length && barcodes[0].rawValue){
+                code = { data: barcodes[0].rawValue };
+              }
             }catch(e){
               nativeBarcodeDetector = null; // matikan untuk sisa sesi ini, lanjut ke jsQR di bawah
             }
@@ -3376,7 +3328,6 @@ async function tickScan(video){
           if(!nativeBarcodeDetector && !code){
             const centerImg = scanCtxFull.getImageData(0, 0, cropW, cropH);
             code = jsQR(centerImg.data, centerImg.width, centerImg.height, JSQR_OPTS);
-            if(!code && (++scanInvertCounter % 4 === 0)){ code = jsQR(centerImg.data, centerImg.width, centerImg.height, { inversionAttempts:'onlyInvert' }); } // QR terbalik (layar HP mode gelap)
           }
         }
       }
@@ -3391,7 +3342,7 @@ async function tickScan(video){
         const cooldownUntil = state.scanCooldowns[scannedCode];
         if(cooldownUntil){
           if(now < cooldownUntil){
-            resume();
+            scheduleNextScan(video);
             return;
           }
           delete state.scanCooldowns[scannedCode]; // jeda sudah berakhir — bersihkan dari peta
@@ -3402,7 +3353,7 @@ async function tickScan(video){
           state.scanCooldowns[scannedCode] = now + SCAN_COOLDOWN_MS;
           playRejectBeep();
           showToast('Pemindaian ditolak — kode QR tidak dikenali / data siswa tidak ditemukan.', 'err');
-          resume();
+          scheduleNextScan(video);
           return;
         }
         // Cek cepat berbasis cache LOKAL dulu (langsung, tanpa jaringan) untuk
@@ -3418,7 +3369,7 @@ async function tickScan(video){
           playRejectBeep();
           const label = state.petugasMode==='masuk' ? 'MASUK' : 'PULANG';
           showToast(`Pemindaian ditolak — ${found.name} sudah tercatat ${label} hari ini pukul ${timeOnly(localDup.timestamp)}.`, 'warn');
-          resume();
+          scheduleNextScan(video);
           return;
         }
         // Belum tercatat menurut cache lokal — kirim & TUNGGU konfirmasi SERVER
@@ -3426,12 +3377,7 @@ async function tickScan(video){
         // perangkat berbeda sama-sama berhasil memindai siswa yang sama pada
         // hari yang sama: server yang jadi wasit tunggal, bukan HP masing-masing.
         const log = { id:uid(), studentId:found.id, type:state.petugasMode, ket:'', note:'', timestamp:now };
-        state.scanCooldowns[scannedCode] = now + SAME_CODE_SUCCESS_COOLDOWN_MS; // kunci sementara selama menunggu server (anti kirim ganda)
-        resume(); // lanjut memindai kartu LAIN tanpa menunggu jaringan/server
-        let result;
-        try{ result = await saveLogEntry(log); }
-        catch(saveErr){ delete state.scanCooldowns[scannedCode]; playRejectBeep(); showToast('Gagal menyimpan pemindaian — pindai ulang kartunya.', 'err'); return; }
-        if(result.sessionExpired){ delete state.scanCooldowns[scannedCode]; return; } // sesi habis — tidak ada yang tercatat
+        const result = await saveLogEntry(log);
         const label = state.petugasMode==='masuk' ? 'MASUK' : 'PULANG';
         if(result.duplicate){
           // Sudah tercatat lebih dulu di PERANGKAT LAIN — selaraskan cache
@@ -3444,7 +3390,7 @@ async function tickScan(video){
           playRejectBeep();
           const waktu = result.existing ? ` pukul ${timeOnly(result.existing.timestamp)}` : '';
           showToast(`Pemindaian ditolak — ${found.name} sudah tercatat ${label} hari ini${waktu} (di perangkat lain).`, 'warn');
-          resume();
+          scheduleNextScan(video);
           return;
         }
         // Siswa ini SUDAH tercatat "Tidak Hadir" (Sakit/Ijin/Emergency/Lainnya
@@ -3458,7 +3404,7 @@ async function tickScan(video){
           playRejectBeep();
           const ketTerdaftar = (result.existing && result.existing.ket) ? result.existing.ket : 'Tidak Hadir';
           showToast(`Pemindaian ditolak — ${found.name} sudah tercatat TIDAK HADIR (${ketTerdaftar}) hari ini, sehingga tidak bisa dicatat ${label}.`, 'warn');
-          resume();
+          scheduleNextScan(video);
           return;
         }
         // BERHASIL — kunci kode QR ini selama 60 detik ke depan; selama itu
@@ -3471,7 +3417,7 @@ async function tickScan(video){
         const offlineNote = result.offline ? ' (belum tersinkron ke server — periksa koneksi)' : '';
         showToast(`Tercatat — ${found.name} ${label} pukul ${timeOnly(now)}${offlineNote}`, result.offline ? 'warn' : 'ok');
         refreshSidePanel();
-        resume();
+        scheduleNextScan(video);
         return;
       }
     }
@@ -3479,7 +3425,7 @@ async function tickScan(video){
     // Abaikan error sesaat (mis. saat rotasi layar/frame belum siap) — jangan
     // menghentikan loop pemindaian karena satu frame gagal dibaca.
   }
-  resume();
+  scheduleNextScan(video);
 }
 
 /* ================= INIT ================= */
